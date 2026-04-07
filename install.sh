@@ -46,6 +46,20 @@ else
     echo "The service \"locationchanger\" has been installed and started"
 fi
 
+if [[ $major_version -ge 15 ]]; then
+    echo ""
+    echo "macOS Sequoia note:"
+    echo "On macOS 15+, SSID detection may require a Shortcuts app shortcut."
+    echo "Create a shortcut named: Current Wi-Fi"
+    echo "Then test it with:"
+    echo "  tmp=\$(mktemp)"
+    echo "  shortcuts run \"Current Wi-Fi\" --output-type public.plain-text --output-path \"\$tmp\""
+    echo "  cat \"\$tmp\""
+    echo "  rm -f \"\$tmp\""
+    echo ""
+    echo "The script also accepts the legacy shortcut name: Current WiFi"
+fi
+
 # install any external callout that is present
 EXTERNAL_CALLOUT_FILE="./locationchanger.callout.sh"
 if [[ -f "$EXTERNAL_CALLOUT_FILE" ]]; then

@@ -11,50 +11,182 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 OS_VERSION=$(sw_vers -productVersion | cut -d. -f1)
 
+is_valid_ssid() {
+    local ssid="$1"
+    [ -n "$ssid" ] && [ "$ssid" != "null" ] && [ "$ssid" != "<redacted>" ] && [ "$ssid" != "<Unable to detect - Privacy Protected>" ]
+}
+
+read_shortcut_output() {
+    local shortcut_name="$1"
+    local tmp output status
+
+    tmp=$(mktemp 2>/dev/null)
+    if [ -z "$tmp" ]; then
+        echo "$(date) Failed to create temporary file for shortcut output" >&2
+        return 1
+    fi
+
+    if shortcuts run "$shortcut_name" --output-type public.plain-text --output-path "$tmp" >/dev/null 2>&1; then
+        output=$(tr -d '\r' < "$tmp" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        rm -f "$tmp"
+        if [ -n "$output" ] && [ "$output" != "null" ] && [ "$output" != "<redacted>" ]; then
+            echo "$output"
+            return 0
+        fi
+        echo "$(date) Shortcut \"$shortcut_name\" returned empty/redacted output" >&2
+    else
+        status=$?
+        rm -f "$tmp"
+        echo "$(date) Failed to run shortcut \"$shortcut_name\" (exit $status). Run it once manually to grant permissions." >&2
+    fi
+
+    return 1
+}
+
+get_ssid_via_shortcuts() {
+    local shortcut_name
+    local ssid=""
+
+    if ! command -v shortcuts >/dev/null 2>&1; then
+        return 1
+    fi
+
+    for shortcut_name in "Current Wi-Fi" "Current WiFi"; do
+        echo "$(date) Trying Shortcuts method with \"$shortcut_name\"..." >&2
+        ssid=$(read_shortcut_output "$shortcut_name") || continue
+        echo "$ssid"
+        return 0
+    done
+
+    return 1
+}
+
+get_wifi_device() {
+    local wifi_device=""
+
+    wifi_device=$(networksetup -listallhardwareports 2>/dev/null | awk '
+        /Hardware Port: (Wi-Fi|AirPort)/ { capture=1; next }
+        capture && /Device: / { sub(/^Device: /, ""); print; exit }
+    ')
+    if [ -n "$wifi_device" ]; then
+        echo "$wifi_device"
+        return 0
+    fi
+
+    wifi_device=$(system_profiler SPAirPortDataType 2>/dev/null | awk '
+        /^[[:space:]]*Interfaces:/ { capture=1; next }
+        capture && /^[[:space:]]*en[0-9]+:/ {
+            gsub(":", "")
+            gsub(/^[[:space:]]*/, "")
+            print
+            exit
+        }
+    ')
+    if [ -n "$wifi_device" ]; then
+        echo "$wifi_device"
+        return 0
+    fi
+
+    return 1
+}
+
+get_ssid_via_ipconfig() {
+    local wifi_device="$1"
+    local ssid=""
+
+    ssid=$(ipconfig getsummary "$wifi_device" 2>/dev/null | awk -F ': ' '/^[[:space:]]*SSID[[:space:]]*: / {print $2; exit}')
+    if is_valid_ssid "$ssid"; then
+        echo "$ssid"
+        return 0
+    fi
+
+    return 1
+}
+
+get_ssid_via_preferred_networks() {
+    local wifi_device="$1"
+    local ssid=""
+
+    if ipconfig getsummary "$wifi_device" 2>/dev/null | grep -Fxq "  Active : FALSE"; then
+        return 1
+    fi
+
+    ssid=$(networksetup -listpreferredwirelessnetworks "$wifi_device" 2>/dev/null | sed -n '2s/^[[:space:]]*//p')
+    if is_valid_ssid "$ssid"; then
+        echo "$ssid"
+        return 0
+    fi
+
+    return 1
+}
+
 get_ssid_comprehensive() {
     local os_version=$(sw_vers -productVersion | cut -d. -f1)
     local ssid=""
+    local wifi_device=""
     
     # For macOS 15.0+, try multiple methods due to privacy restrictions
     if [ "$os_version" -ge "15" ]; then
         echo "$(date) macOS $os_version detected, using comprehensive SSID detection" >&2
         
         # Method 1: Try shortcuts if available
-        if command -v shortcuts >/dev/null 2>&1; then
-            echo "$(date) Trying Shortcuts method..." >&2
-            ssid=$(shortcuts run "Current Wi-Fi" 2>/dev/null | tr -d '\r' | sed 's/^\s*//;s/\s*$//')
-            if [ -n "$ssid" ] && [ "$ssid" != "null" ] && [ "$ssid" != "<redacted>" ]; then
-                echo "$(date) SSID found via Shortcuts: $ssid" >&2
-                echo "$ssid"
-                return 0
-            fi
-            echo "$(date) Shortcuts method failed or returned redacted/null" >&2
+        ssid=$(get_ssid_via_shortcuts)
+        if [ -n "$ssid" ]; then
+            echo "$(date) SSID found via Shortcuts: $ssid" >&2
+            echo "$ssid"
+            return 0
         fi
+        echo "$(date) Shortcuts method failed" >&2
         
-        # Method 2: Try networksetup
-        echo "$(date) Trying networksetup method..." >&2
-        ssid=$(networksetup -getairportnetwork en0 2>/dev/null | sed 's/Current Wi-Fi Network: //' | grep -v "You are not associated")
-        if [ -n "$ssid" ] && [ "$ssid" != "You are not associated with an AirPort network." ]; then
+        # Method 2: Resolve Wi-Fi interface
+        wifi_device=$(get_wifi_device || true)
+        [ -z "$wifi_device" ] && wifi_device="en0"
+        echo "$(date) Using Wi-Fi device $wifi_device" >&2
+
+        # Method 3: Try ipconfig summary
+        echo "$(date) Trying ipconfig method on device $wifi_device..." >&2
+        ssid=$(get_ssid_via_ipconfig "$wifi_device")
+        if is_valid_ssid "$ssid"; then
+            echo "$(date) SSID found via ipconfig: $ssid" >&2
+            echo "$ssid"
+            return 0
+        fi
+        echo "$(date) ipconfig method failed or returned redacted" >&2
+
+        # Method 4: Try networksetup
+        echo "$(date) Trying networksetup method on device $wifi_device..." >&2
+        ssid=$(networksetup -getairportnetwork "$wifi_device" 2>/dev/null | sed 's/Current Wi-Fi Network: //' | grep -v "You are not associated")
+        if is_valid_ssid "$ssid" && [ "$ssid" != "You are not associated with an AirPort network." ]; then
             echo "$(date) SSID found via networksetup: $ssid" >&2
             echo "$ssid"
             return 0
         fi
         echo "$(date) networksetup method failed" >&2
         
-        # Method 3: Try system preferences (may require admin)
+        # Method 5: Best-effort fallback from preferred network ordering on newer macOS
+        echo "$(date) Trying preferred network list fallback on device $wifi_device..." >&2
+        ssid=$(get_ssid_via_preferred_networks "$wifi_device")
+        if is_valid_ssid "$ssid"; then
+            echo "$(date) SSID inferred via preferred network list: $ssid" >&2
+            echo "$ssid"
+            return 0
+        fi
+        echo "$(date) preferred network list fallback failed" >&2
+
+        # Method 6: Try system preferences (may require admin)
         echo "$(date) Trying system preferences method..." >&2
         ssid=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.airport.preferences 2>/dev/null | grep -A 1 "SSID_STR" | tail -1 | sed 's/.*= "\(.*\)";/\1/' 2>/dev/null)
-        if [ -n "$ssid" ] && [ "$ssid" != "<redacted>" ]; then
+        if is_valid_ssid "$ssid"; then
             echo "$(date) SSID found via system preferences: $ssid" >&2
             echo "$ssid"
             return 0
         fi
         echo "$(date) System preferences method failed" >&2
         
-        # Method 4: Try system_profiler (likely to be redacted but worth trying)
+        # Method 7: Try system_profiler (likely to be redacted but worth trying)
         echo "$(date) Trying system_profiler method..." >&2
         ssid=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Current Network/ {getline; gsub(":", ""); gsub(/^[[:space:]]*/, ""); gsub(/[[:space:]]*$/, ""); print; exit}')
-        if [ -n "$ssid" ] && [ "$ssid" != "<redacted>" ]; then
+        if is_valid_ssid "$ssid"; then
             echo "$(date) SSID found via system_profiler: $ssid" >&2
             echo "$ssid"
             return 0
@@ -67,7 +199,7 @@ get_ssid_comprehensive() {
         # Legacy method for older macOS versions
         echo "$(date) Using legacy SSID detection for macOS $os_version" >&2
         ssid=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Current Network/ {getline; gsub(":", ""); print; exit}' | xargs)
-        if [ -n "$ssid" ]; then
+        if is_valid_ssid "$ssid"; then
             echo "$(date) SSID found via legacy method: $ssid" >&2
             echo "$ssid"
             return 0
@@ -110,7 +242,7 @@ if [ -f "$MAP_FILE" ]; then
       echo "Skipping empty line"
       true
 		else
-			wifi=$(echo $wifi | tr -d '"' )
+			wifi=$(echo "$wifi" | tr -d '"' )
 			echo "Checking mapping: '$loc' -> '$wifi' against SSID '$SSID'"
 			if [[ "$wifi" == "$SSID" ]]; then
 					LOCATION="$loc"

@@ -42,3 +42,5 @@ Package.resolved
 # Backup files
 *.bak
 *.backup
+outputs
+docs

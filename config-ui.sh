@@ -25,43 +25,144 @@ print_header() {
 }
 
 # Function to get current SSID
+is_valid_ssid() {
+    local ssid="$1"
+    [ -n "$ssid" ] && [ "$ssid" != "null" ] && [ "$ssid" != "<redacted>" ] && [ "$ssid" != "<Unable to detect - Privacy Protected>" ]
+}
+
+read_shortcut_output() {
+    local shortcut_name="$1"
+    local tmp output
+
+    tmp=$(mktemp 2>/dev/null) || return 1
+
+    if shortcuts run "$shortcut_name" --output-type public.plain-text --output-path "$tmp" >/dev/null 2>&1; then
+        output=$(tr -d '\r' < "$tmp" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        rm -f "$tmp"
+        if [ -n "$output" ] && [ "$output" != "null" ] && [ "$output" != "<redacted>" ]; then
+            echo "$output"
+            return 0
+        fi
+    else
+        rm -f "$tmp"
+    fi
+
+    return 1
+}
+
+get_wifi_device() {
+    local wifi_device=""
+
+    wifi_device=$(networksetup -listallhardwareports 2>/dev/null | awk '
+        /Hardware Port: (Wi-Fi|AirPort)/ { capture=1; next }
+        capture && /Device: / { sub(/^Device: /, ""); print; exit }
+    ')
+    if [ -n "$wifi_device" ]; then
+        echo "$wifi_device"
+        return 0
+    fi
+
+    wifi_device=$(system_profiler SPAirPortDataType 2>/dev/null | awk '
+        /^[[:space:]]*Interfaces:/ { capture=1; next }
+        capture && /^[[:space:]]*en[0-9]+:/ {
+            gsub(":", "")
+            gsub(/^[[:space:]]*/, "")
+            print
+            exit
+        }
+    ')
+    if [ -n "$wifi_device" ]; then
+        echo "$wifi_device"
+        return 0
+    fi
+
+    return 1
+}
+
+get_ssid_via_ipconfig() {
+    local wifi_device="$1"
+    local ssid=""
+
+    ssid=$(ipconfig getsummary "$wifi_device" 2>/dev/null | awk -F ': ' '/^[[:space:]]*SSID[[:space:]]*: / {print $2; exit}')
+    if is_valid_ssid "$ssid"; then
+        echo "$ssid"
+        return 0
+    fi
+
+    return 1
+}
+
+get_ssid_via_preferred_networks() {
+    local wifi_device="$1"
+    local ssid=""
+
+    if ipconfig getsummary "$wifi_device" 2>/dev/null | grep -Fxq "  Active : FALSE"; then
+        return 1
+    fi
+
+    ssid=$(networksetup -listpreferredwirelessnetworks "$wifi_device" 2>/dev/null | sed -n '2s/^[[:space:]]*//p')
+    if is_valid_ssid "$ssid"; then
+        echo "$ssid"
+        return 0
+    fi
+
+    return 1
+}
+
 get_current_ssid() {
     local os_version=$(sw_vers -productVersion | cut -d. -f1)
     local ssid=""
+    local shortcut_name
+    local wifi_device=""
     
-    # For macOS 26.0+, try multiple methods due to privacy restrictions
-    if [ "$os_version" -ge "26" ]; then
+    # For macOS 15.0+, try multiple methods due to privacy restrictions
+    if [ "$os_version" -ge "15" ]; then
         # Method 1: Try shortcuts if available (requires user to create shortcut)
         if command -v shortcuts >/dev/null 2>&1; then
-            ssid=$(shortcuts run "Current Wi-Fi" 2>/dev/null | tr -d '\r' | sed 's/^\s*//;s/\s*$//')
-            if [ -n "$ssid" ] && [ "$ssid" != "null" ] && [ "$ssid" != "<redacted>" ]; then
+            for shortcut_name in "Current Wi-Fi" "Current WiFi"; do
+                ssid=$(read_shortcut_output "$shortcut_name") || continue
                 echo "$ssid"
                 return 0
-            fi
+            done
         fi
         
         # Method 2: Try networksetup with different approaches
-        ssid=$(networksetup -getairportnetwork en0 2>/dev/null | sed 's/Current Wi-Fi Network: //' | grep -v "You are not associated")
-        if [ -n "$ssid" ] && [ "$ssid" != "You are not associated with an AirPort network." ]; then
+        wifi_device=$(get_wifi_device || true)
+        [ -z "$wifi_device" ] && wifi_device="en0"
+
+        ssid=$(get_ssid_via_ipconfig "$wifi_device")
+        if is_valid_ssid "$ssid"; then
+            echo "$ssid"
+            return 0
+        fi
+
+        ssid=$(networksetup -getairportnetwork "$wifi_device" 2>/dev/null | sed 's/Current Wi-Fi Network: //' | grep -v "You are not associated")
+        if is_valid_ssid "$ssid" && [ "$ssid" != "You are not associated with an AirPort network." ]; then
+            echo "$ssid"
+            return 0
+        fi
+
+        ssid=$(get_ssid_via_preferred_networks "$wifi_device")
+        if is_valid_ssid "$ssid"; then
             echo "$ssid"
             return 0
         fi
         
         # Method 3: Check if we can get SSID from system preferences (may require admin)
         ssid=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.airport.preferences 2>/dev/null | grep -A 1 "SSID_STR" | tail -1 | sed 's/.*= "\(.*\)";/\1/' 2>/dev/null)
-        if [ -n "$ssid" ] && [ "$ssid" != "<redacted>" ]; then
+        if is_valid_ssid "$ssid"; then
             echo "$ssid"
             return 0
         fi
         
         # Method 4: Try system_profiler but handle redacted case
         ssid=$(system_profiler SPAirPortDataType 2>/dev/null | awk '/Current Network/ {getline; gsub(":", ""); gsub(/^[[:space:]]*/, ""); gsub(/[[:space:]]*$/, ""); print; exit}')
-        if [ -n "$ssid" ] && [ "$ssid" != "<redacted>" ]; then
+        if is_valid_ssid "$ssid"; then
             echo "$ssid"
             return 0
         fi
         
-        # If all methods fail on macOS 26.0+, return a helpful message
+        # If all methods fail on macOS 15.0+, return a helpful message
         echo "<Unable to detect - Privacy Protected>"
     else
         # Legacy method for older macOS versions
@@ -72,7 +173,14 @@ get_current_ssid() {
 
 # Function to get available locations
 get_available_locations() {
-    networksetup -listlocations 2>/dev/null | grep -v "^$" || echo "Automatic"
+    local locations
+
+    locations=$(networksetup -listlocations 2>/dev/null | sed 's/^\*//' | sed 's/^[[:space:]]*//' | grep -v "^$" | grep -v "^An asterisk")
+    if [[ -n "$locations" ]]; then
+        printf '%s\n' "$locations"
+    else
+        echo "Automatic"
+    fi
 }
 
 # Function to load existing mappings
@@ -85,7 +193,9 @@ load_mappings() {
             fi
         done < "$CONFIG_FILE"
     fi
-    printf '%s\n' "${mappings[@]}"
+    if [[ ${#mappings[@]} -gt 0 ]]; then
+        printf '%s\n' "${mappings[@]}"
+    fi
 }
 
 # Function to save mappings
@@ -129,8 +239,13 @@ EOF
 # Function to display current status
 show_status() {
     local current_ssid=$(get_current_ssid)
-    local mapping_count=$(load_mappings | wc -l | xargs)
+    local mappings_output=$(load_mappings)
+    local mapping_count=0
     local os_version=$(sw_vers -productVersion | cut -d. -f1)
+
+    if [[ -n "$mappings_output" ]]; then
+        mapping_count=$(printf '%s\n' "$mappings_output" | wc -l | xargs)
+    fi
     
     echo -e "${YELLOW}Current Status:${NC}"
     echo -e "┌─────────────────────────────────────────────────────────────┐"
@@ -138,9 +253,9 @@ show_status() {
     printf "│ Mappings:      %-45s │\n" "$mapping_count"
     echo -e "└─────────────────────────────────────────────────────────────┘"
     
-    # Show privacy notice for macOS 26.0+
-    if [ "$os_version" -ge "26" ] && [[ "$current_ssid" == *"Privacy Protected"* || "$current_ssid" == "<redacted>" ]]; then
-        echo -e "${YELLOW}Note:${NC} macOS 26.0+ has enhanced privacy protections."
+    # Show privacy notice for macOS 15.0+
+    if [ "$os_version" -ge "15" ] && [[ "$current_ssid" == *"Privacy Protected"* || "$current_ssid" == "<redacted>" ]]; then
+        echo -e "${YELLOW}Note:${NC} macOS 15.0+ has enhanced privacy protections."
         echo -e "      To get SSID detection working:"
         echo -e "      1. Create a Shortcuts app shortcut named 'Current Wi-Fi'"
         echo -e "      2. Or manually enter your SSID mappings below"
@@ -174,10 +289,15 @@ show_mappings() {
 # Function to add mapping
 add_mapping() {
     local current_ssid=$(get_current_ssid)
-    local locations=($(get_available_locations))
+    local detected_ssid_available=true
+
+    if [[ "$current_ssid" == "<Unable to detect - Privacy Protected>" || "$current_ssid" == "<redacted>" || "$current_ssid" == "Unknown" ]]; then
+        detected_ssid_available=false
+    fi
     
     echo -e "${YELLOW}Add SSID Mapping:${NC}"
-    echo "Available locations: ${locations[*]}"
+    echo "Available locations:"
+    get_available_locations | sed 's/^/  - /'
     echo "Current SSID: $current_ssid"
     echo
     
@@ -187,13 +307,23 @@ add_mapping() {
         return 1
     fi
     
-    read -p "Enter SSID (or press Enter to use current '$current_ssid'): " ssid
-    if [[ -z "$ssid" ]]; then
+    if [[ "$detected_ssid_available" == true ]]; then
+        read -p "Enter SSID (or press Enter to use current '$current_ssid'): " ssid
+    else
+        read -p "Enter SSID: " ssid
+    fi
+
+    if [[ -z "$ssid" && "$detected_ssid_available" == true ]]; then
         ssid="$current_ssid"
     fi
     
     if [[ -z "$ssid" ]]; then
         echo -e "${RED}Invalid SSID${NC}"
+        return 1
+    fi
+
+    if [[ "$ssid" == "<Unable to detect - Privacy Protected>" || "$ssid" == "<redacted>" || "$ssid" == "Unknown" ]]; then
+        echo -e "${RED}SSID detection is currently unavailable. Please enter the real Wi-Fi name manually or create the Shortcuts shortcut first.${NC}"
         return 1
     fi
     
